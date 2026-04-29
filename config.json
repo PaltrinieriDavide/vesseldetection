@@ -1,0 +1,75 @@
+{
+  "project_name": "vessel_detection_regression",
+  "device": "cuda",
+  
+  "paths": {
+    "fusar_train_json": "/root/dark-vessel-paltrinieri/ICIP_vessel_detection_regression/datasets/FUSAR/train/annotations.json",
+    "fusar_train_images": "/root/dark-vessel-paltrinieri/ICIP_vessel_detection_regression/datasets/FUSAR/train/images",
+    "fusar_val_json": "/root/dark-vessel-paltrinieri/ICIP_vessel_detection_regression/datasets/FUSAR/val/annotations.json",
+    "fusar_val_images": "/root/dark-vessel-paltrinieri/ICIP_vessel_detection_regression/datasets/FUSAR/val/images",
+    "fusar_test_json": "/root/dark-vessel-paltrinieri/ICIP_vessel_detection_regression/datasets/FUSAR/test/annotations.json",
+    "fusar_test_images": "/root/dark-vessel-paltrinieri/ICIP_vessel_detection_regression/datasets/FUSAR/test/images",
+    
+    "hrsid_train_json": "/root/dark-vessel-paltrinieri/HRSID_pipeline/HRSID_JPG/HRSID_JPG/annotations/train2017.json",
+    "hrsid_train_images": "/root/dark-vessel-paltrinieri/HRSID_pipeline/HRSID_JPG/HRSID_JPG/JPEGImages",
+    "hrsid_val_json": "/root/dark-vessel-paltrinieri/HRSID_pipeline/HRSID_JPG/HRSID_JPG/annotations/val2017.json",
+    "hrsid_val_images": "/root/dark-vessel-paltrinieri/HRSID_pipeline/HRSID_JPG/HRSID_JPG/JPEGImages",
+    "hrsid_test_json": "/root/dark-vessel-paltrinieri/HRSID_pipeline/HRSID_JPG/HRSID_JPG/annotations/test2017.json",
+    "hrsid_test_images": "/root/dark-vessel-paltrinieri/HRSID_pipeline/HRSID_JPG/HRSID_JPG/JPEGImages",
+    
+    "checkpoint_dir": "./checkpoints",
+    "logs_dir": "./logs",
+    "results_dir": "./results"
+  },
+  
+  "preprocessing": {
+      "target_size": 512,
+      "clahe_clip_limit": 2.0
+  },
+  
+  "model": {
+    "num_classes": 4,
+    "pretrained_backbone": true
+  },
+  
+  "training_phases": {
+    "phase1": {
+      "name": "Detection + Regression (HRSID)",
+      "dataset": "hrsid",
+      "num_epochs": 0,
+      "batch_size": 2,
+      "learning_rate": 0.0001,
+      "freeze_backbone": false,
+      "freeze_classification": true,
+      "freeze_regression": false
+    },
+    "phase2": {
+      "name": "Classification Training (FUSAR)",
+      "dataset": "fusar",
+      "num_epochs": 1,
+      "batch_size": 2,
+      "learning_rate": 0.0001,
+      "freeze_backbone": false,
+      "freeze_detection": true,
+      "freeze_regression": true,
+      "freeze_classification": false
+    },
+    "phase3": {
+      "name": "Fine-tuning (Combined)",
+      "dataset": "combined",
+      "num_epochs": 1,
+      "batch_size": 2,
+      "learning_rate": 0.00005,
+      "freeze_backbone": false,
+      "freeze_classification": false,
+      "freeze_regression": false
+    }
+  },
+  
+  "common_training": {
+    "num_workers": 4,
+    "log_interval": 10,
+    "val_interval": 1,
+    "early_stopping_patience": 10
+  }
+}

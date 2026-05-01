@@ -48,7 +48,7 @@ class FUSARDataset(torch.utils.data.Dataset):
         self.augment = augment
         
         # Preprocessing con CLAHE
-        self.preprocess = SARPreprocess(use_clahe=True)
+        self.preprocess = SARPreprocess(mean=2.6584, std=0.7534, use_clahe=True)
         
         self.images = {img['id']: img for img in self.coco_data['images']}
         self.annotations = {ann['image_id']: ann for ann in self.coco_data['annotations']}
@@ -113,7 +113,7 @@ class HRSIDDataset(torch.utils.data.Dataset):
         self.augment = augment
         
         # Preprocessing con CLAHE
-        self.preprocess = SARPreprocess(use_clahe=True)
+        self.preprocess = SARPreprocess(mean=3.5796, std=0.7026, use_clahe=True)
         
         self.images = {img['id']: img for img in self.coco_data['images']}
         self.annotations_by_image = defaultdict(list)

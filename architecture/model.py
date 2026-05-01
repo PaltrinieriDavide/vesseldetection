@@ -9,7 +9,7 @@ from torchvision.ops import MultiScaleRoIAlign
 from typing import Dict, List, Optional
 import math
 
-# --- 1. MODULO MORFOLOGICO PYTORCH (Dal Paper) ---
+# --- 1. MODULO MORFOLOGICO PYTORCH ---
 class MorphologicalPreprocessing(nn.Module):
     def __init__(self, kernel_size=3):
         super().__init__()
@@ -17,37 +17,29 @@ class MorphologicalPreprocessing(nn.Module):
         self.kernel_size = kernel_size
 
     def erosion(self, x):
-        # L'erosione equivale a un min-pooling. In PyTorch si ottiene invertendo il segno.
         return -F.max_pool2d(-x, self.kernel_size, stride=1, padding=self.pad)
 
     def dilation(self, x):
-        # La dilatazione equivale a un max-pooling.
         return F.max_pool2d(x, self.kernel_size, stride=1, padding=self.pad)
 
     def forward(self, x):
-        # x shape: [B, 1, H, W]
         ero = self.erosion(x)
         dil = self.dilation(x)
-        
         opening = self.dilation(ero)
         closing = self.erosion(dil)
-        
         top_hat = x - opening
         black_hat = closing - x
         morph_grad = dil - ero
-
-        # Il paper concatena: Originale, Erosione, Opening, Top-hat, Black-hat, Morph-gradient
-        # Output shape:[B, 6, H, W]
+        
+        # Ritorna ESATTAMENTE 6 canali (Originale + 5 operazioni)
         return torch.cat([x, ero, opening, top_hat, black_hat, morph_grad], dim=1)
 
-
-# --- 2. COORDINATE CHANNEL ATTENTION (CCA) (Dal Paper) ---
+# --- 2. COORDINATE CHANNEL ATTENTION (CCA) CON RESIDUAL ---
 class CCA(nn.Module):
     def __init__(self, in_channels, reduction=16):
         super().__init__()
         self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
         self.pool_w = nn.AdaptiveAvgPool2d((1, None))
-
         mip = max(8, in_channels // reduction)
 
         self.conv1 = nn.Conv2d(in_channels, mip, kernel_size=1, stride=1, padding=0)
@@ -56,88 +48,119 @@ class CCA(nn.Module):
 
         self.conv_h = nn.Conv2d(mip, in_channels, kernel_size=1, stride=1, padding=0)
         self.conv_w = nn.Conv2d(mip, in_channels, kernel_size=1, stride=1, padding=0)
+        
+        torch.nn.init.constant_(self.conv_h.bias, 2.0)
+        torch.nn.init.constant_(self.conv_w.bias, 2.0)
 
     def forward(self, x):
         n, c, h, w = x.size()
         x_h = self.pool_h(x)
         x_w = self.pool_w(x).permute(0, 1, 3, 2)
-
         y = torch.cat([x_h, x_w], dim=2)
         y = self.act(self.bn1(self.conv1(y)))
-
-        x_h, x_w = torch.split(y,[h, w], dim=2)
+        x_h, x_w = torch.split(y, [h, w], dim=2)
         x_w = x_w.permute(0, 1, 3, 2)
-
         a_h = torch.sigmoid(self.conv_h(x_h))
         a_w = torch.sigmoid(self.conv_w(x_w))
+        
+        return x + (x * a_h * a_w)
 
-        return x * a_h * a_w
+# --- 3. BOTTOM-UP PATH (Bidirezionale) ---
+class BottomUpPath(nn.Module):
+    def __init__(self, channels=256):
+        super().__init__()
+        self.down_convs = nn.ModuleDict({
+            '1': nn.Conv2d(channels, channels, 3, stride=2, padding=1),
+            '2': nn.Conv2d(channels, channels, 3, stride=2, padding=1),
+            '3': nn.Conv2d(channels, channels, 3, stride=2, padding=1),
+            'pool': nn.Conv2d(channels, channels, 3, stride=2, padding=1),
+        })
 
+    def forward(self, features):
+        out = OrderedDict()
+        keys = list(features.keys())
+        out[keys[0]] = features[keys[0]]
+        
+        for i in range(1, len(keys)):
+            prev_k, curr_k = keys[i-1], keys[i]
+            downsampled = self.down_convs[curr_k](out[prev_k])
+            if downsampled.shape != features[curr_k].shape:
+                downsampled = F.interpolate(downsampled, size=features[curr_k].shape[2:])
+            out[curr_k] = features[curr_k] + downsampled
+        return out
 
-# --- 3. BACKBONE POTENZIATO CON MORPH E CCA ---
+# --- 4. BACKBONE POTENZIATO TOTALE ---
 class EnhancedBackbone(nn.Module):
     def __init__(self, base_backbone):
         super().__init__()
-        self.morph = MorphologicalPreprocessing(kernel_size=3)
+        self.morph = MorphologicalPreprocessing()
         self.base_backbone = base_backbone
         self.out_channels = base_backbone.out_channels
         
-        # Applichiamo il CCA ad ogni livello della Feature Pyramid Network
         self.cca_modules = nn.ModuleDict({
-            '0': CCA(256),
-            '1': CCA(256),
-            '2': CCA(256),
-            '3': CCA(256),
-            'pool': CCA(256)
+            k: CCA(self.out_channels) for k in ['0', '1', '2', '3', 'pool']
         })
+        self.bottom_up = BottomUpPath(self.out_channels)
 
     def forward(self, x):
-        # 1. Preprocessing morfologico: trasforma l'input da 1 a 6 canali
-        x_morph = self.morph(x)
+        # 1 Canale -> 6 Canali
+        x = self.morph(x)
+        # Il base_backbone ora si aspetta 6 canali
+        features = self.base_backbone(x)
         
-        # 2. Estrazione feature originale
-        features = self.base_backbone(x_morph)
-        
-        # 3. Applicazione del CCA Module sulle feature maps
-        out = OrderedDict()
+        cca_features = OrderedDict()
         for k, v in features.items():
-            if k in self.cca_modules:
-                out[k] = self.cca_modules[k](v)
-            else:
-                out[k] = v
-        return out
+            cca_features[k] = self.cca_modules[k](v) if k in self.cca_modules else v
+            
+        return self.bottom_up(cca_features)
+
 
 class HybridVesselModel(nn.Module):
     def __init__(self, num_classes: int = 4, pretrained_backbone: bool = True):
         super().__init__()
         
-        # 1. Creiamo il backbone base di torchvision
-        base_backbone = resnet_fpn_backbone(backbone_name='resnet50', weights='DEFAULT' if pretrained_backbone else None, trainable_layers=3)
-        conv1 = base_backbone.body.conv1
-        
-        # 2. MODIFICA: Il modulo morfologico restituirà 6 canali, quindi modifichiamo conv1 per accettarne 6
-        base_backbone.body.conv1 = nn.Conv2d(6, conv1.out_channels, kernel_size=conv1.kernel_size, stride=conv1.stride, padding=conv1.padding, bias=False)
-        # Inizializziamo i pesi replicando la media su 6 canali per non distruggere il pre-training
-        base_backbone.body.conv1.weight.data = conv1.weight.data.mean(dim=1, keepdim=True).repeat(1, 6, 1, 1) / 6.0
+        # 1. Utilizziamo ResNeXt50
+        base_backbone = resnet_fpn_backbone(
+            backbone_name='resnext50_32x4d', 
+            weights='DEFAULT' if pretrained_backbone else None, 
+            trainable_layers=3
+        )
 
-        # 3. INCAPSULIAMO IL BACKBONE con Morph e CCA
+        # 2. ADATTIAMO LOGICAMENTE IL CONV1 A 6 CANALI (La tua intuizione originale!)
+        conv1 = base_backbone.body.conv1
+        new_conv1 = nn.Conv2d(6, conv1.out_channels, kernel_size=conv1.kernel_size, 
+                              stride=conv1.stride, padding=conv1.padding, bias=False)
+        if pretrained_backbone:
+            # Spalmiamo i pesi sui 6 canali in modo equilibrato
+            new_conv1.weight.data = conv1.weight.data.mean(dim=1, keepdim=True).repeat(1, 6, 1, 1) / 6.0
+        base_backbone.body.conv1 = new_conv1
+
+        # 3. Assembliamo il backbone
         self.backbone = EnhancedBackbone(base_backbone)
 
-        # Il resto rimane INVARIATO
+        # 4. Ancore SAR Estreme
         anchor_sizes = ((8, 16, 32, 64, 128, 256),) * 5
-        aspect_ratios = ((0.5, 1.0, 2.0),) * 5
-        self.detector = FasterRCNN(self.backbone, num_classes=2, rpn_anchor_generator=AnchorGenerator(anchor_sizes, aspect_ratios), box_regression_loss_type="giou", image_mean=[0.0], image_std=[1.0])
-
+        aspect_ratios = ((0.2, 0.5, 1.0, 2.0, 5.0),) * 5
+        
+        self.detector = FasterRCNN(
+            self.backbone, 
+            num_classes=2, 
+            rpn_anchor_generator=AnchorGenerator(anchor_sizes, aspect_ratios), 
+            box_regression_loss_type="ciou", 
+            
+            # IMPEDIAMO IL BROADCASTING DI PYTORCH (1 singolo valore = 1 singolo canale)
+            image_mean=[0.0], 
+            image_std=[1.0],
+            
+            box_score_thresh=0.15,
+            box_nms_thresh=0.4          
+        )
+        
         self.roi_pool = MultiScaleRoIAlign(featmap_names=['0', '1', '2', '3'], output_size=7, sampling_ratio=2)
+        
         self.attr_features = nn.Sequential(
-            nn.Linear(256 * 7 * 7, 1024), 
-            nn.LayerNorm(1024),
-            nn.ReLU(), 
-            nn.Dropout(0.3),
-            nn.Linear(1024, 512), 
-            nn.LayerNorm(512),
-            nn.ReLU(), 
-            nn.Dropout(0.3)
+            nn.Linear(256 * 7 * 7, 1024), nn.LayerNorm(1024), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(1024, 512), nn.LayerNorm(512), nn.ReLU(), nn.Dropout(0.3)
         )        
         self.cls_head = nn.Linear(512, num_classes)
         self.reg_head = nn.Sequential(nn.Linear(512 + 2, 256), nn.ReLU(), nn.Linear(256, 2), nn.Sigmoid())
@@ -146,7 +169,8 @@ class HybridVesselModel(nn.Module):
             'loss_cls': 1.0,
             'loss_reg': 10.0
         }
-
+        
+        
     def _pad_box(self, box, img_h, img_w, padding_factor=0.10):
         """Aggiunge un padding percentuale alla bbox con controlli di sicurezza"""
         x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
@@ -347,20 +371,18 @@ class HybridVesselModel(nn.Module):
         for p in self.reg_head.parameters(): p.requires_grad = True
         
     def unfreeze_backbone_last_layers(self):
-        """Sblocca solo l'ultimo blocco di ResNet (layer4), FPN e CCA per adattarsi senza distruggere i pesi"""
         for p in self.backbone.parameters(): 
             p.requires_grad = False
             
-        # Accediamo a base_backbone ora
         if hasattr(self.backbone.base_backbone, 'body') and hasattr(self.backbone.base_backbone.body, 'layer4'):
-            for p in self.backbone.base_backbone.body.layer4.parameters(): 
-                p.requires_grad = True
+            for p in self.backbone.base_backbone.body.layer4.parameters(): p.requires_grad = True
                 
         if hasattr(self.backbone.base_backbone, 'fpn'):
-            for p in self.backbone.base_backbone.fpn.parameters(): 
-                p.requires_grad = True
+            for p in self.backbone.base_backbone.fpn.parameters(): p.requires_grad = True
                 
-        # Sblocchiamo i nuovi moduli di attenzione CCA affinché possano imparare!
         if hasattr(self.backbone, 'cca_modules'):
-            for p in self.backbone.cca_modules.parameters():
-                p.requires_grad = True
+            for p in self.backbone.cca_modules.parameters(): p.requires_grad = True
+            
+        # NUOVO: Sblocchiamo anche la FPN Bidirezionale!
+        if hasattr(self.backbone, 'bottom_up'):
+            for p in self.backbone.bottom_up.parameters(): p.requires_grad = True

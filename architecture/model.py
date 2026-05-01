@@ -147,22 +147,27 @@ class HybridVesselModel(nn.Module):
             num_classes=2, 
             rpn_anchor_generator=AnchorGenerator(anchor_sizes, aspect_ratios), 
             box_regression_loss_type="ciou", 
-            
-            # IMPEDIAMO IL BROADCASTING DI PYTORCH (1 singolo valore = 1 singolo canale)
             image_mean=[0.0], 
             image_std=[1.0],
-            
-            box_score_thresh=0.15,
-            box_nms_thresh=0.4          
+            box_score_thresh=0.20,      # MODIFICATO DA 0.15 a 0.20
+            box_nms_thresh=0.5          # MODIFICATO DA 0.4 a 0.5
         )
-        
+
         self.roi_pool = MultiScaleRoIAlign(featmap_names=['0', '1', '2', '3'], output_size=7, sampling_ratio=2)
         
-        self.attr_features = nn.Sequential(
-            nn.Linear(256 * 7 * 7, 1024), nn.LayerNorm(1024), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(1024, 512), nn.LayerNorm(512), nn.ReLU(), nn.Dropout(0.3)
-        )        
+        # --- MODIFICA DECOUPLED HEADS ---
+        # 1. Testa di Classificazione (FUSAR) - Alto Dropout (0.5) per distruggere l'overfitting
+        self.cls_features = nn.Sequential(
+            nn.Linear(256 * 7 * 7, 1024), nn.LayerNorm(1024), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(1024, 512), nn.LayerNorm(512), nn.ReLU(), nn.Dropout(0.5)
+        )
         self.cls_head = nn.Linear(512, num_classes)
+
+        # 2. Testa di Regressione (HRSID) - Basso Dropout (0.1) per preservare la memoria spaziale
+        self.reg_features = nn.Sequential(
+            nn.Linear(256 * 7 * 7, 1024), nn.LayerNorm(1024), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(1024, 512), nn.LayerNorm(512), nn.ReLU(), nn.Dropout(0.1)
+        )
         self.reg_head = nn.Sequential(nn.Linear(512 + 2, 256), nn.ReLU(), nn.Linear(256, 2), nn.Sigmoid())
 
         self.loss_weights = {
@@ -292,7 +297,6 @@ class HybridVesselModel(nn.Module):
                     _, h, w = images[i].shape
                     boxes.append(self._get_best_centered_box(out, h, w, images_stack.device))
                 else: # Inferenza pura (Validation/Test senza target specifici)
-                    # MODIFICA 2: Aggiunto 'multi' anche qui per usare le predizioni della RPN
                     if phase in ['det_reg', 'multi']: 
                         boxes.append(detections[i]['boxes'])
                     else: 
@@ -304,8 +308,14 @@ class HybridVesselModel(nn.Module):
         
         if total_boxes > 0:
             roi_feats = self.roi_pool(features, boxes, padded_sizes).flatten(start_dim=1)
-            attr_feats = self.attr_features(roi_feats)
-            logits = self.cls_head(attr_feats)
+            
+            # --- MODIFICA 1: DECOUPLED HEADS ---
+            # Percorso Classificazione (FUSAR)
+            cls_feats = self.cls_features(roi_feats)
+            logits = self.cls_head(cls_feats)
+            
+            # Percorso Regressione (HRSID)
+            reg_feats = self.reg_features(roi_feats)
             
             box_dims =[]
             for i, b in enumerate(boxes):
@@ -316,7 +326,8 @@ class HybridVesselModel(nn.Module):
                     box_dims.append(torch.stack([bw, bh], dim=1))
             
             box_dims = torch.cat(box_dims, dim=0)
-            lw_pred = self.reg_head(torch.cat([attr_feats, box_dims], dim=1))
+            # Concateniamo reg_feats invece del vecchio attr_feats
+            lw_pred = self.reg_head(torch.cat([reg_feats, box_dims], dim=1))
         else:
             # Fallback se tutto il batch è vuoto
             logits = torch.empty((0, self.cls_head.out_features), device=images_stack.device)
@@ -324,7 +335,6 @@ class HybridVesselModel(nn.Module):
 
         out = {"logits": logits, "dimensions": lw_pred, "boxes": boxes}
         
-        # MODIFICA 3: Passiamo i box predetti al tracker delle metriche anche in 'multi'
         if phase in ['det_reg', 'multi'] and not self.training:
             out["detections"] = detections
             
@@ -345,44 +355,74 @@ class HybridVesselModel(nn.Module):
                 current_box_idx += num_boxes
                 
             if len(valid_cls_idx) > 0:
-                losses['loss_cls'] = F.cross_entropy(logits[valid_cls_idx], torch.cat(cls_targets)) * self.loss_weights['loss_cls']
+                # --- MODIFICA 2: FOCAL LOSS ---
+                target_cls = torch.cat(cls_targets)
+                pred_logits = logits[valid_cls_idx]
+                
+                # Calcolo Cross Entropy non ridotta
+                ce_loss = F.cross_entropy(pred_logits, target_cls, reduction='none')
+                # Calcolo p_t
+                pt = torch.exp(-ce_loss)
+                # Applica gamma (2.0)
+                gamma = 2.0
+                focal_loss = (((1 - pt) ** gamma) * ce_loss).mean()
+                
+                losses['loss_cls'] = focal_loss * self.loss_weights['loss_cls']
+                
             if len(valid_reg_idx) > 0:
                 losses['loss_reg'] = F.smooth_l1_loss(lw_pred[valid_reg_idx], torch.cat(reg_targets)) * self.loss_weights['loss_reg']
 
         return out, losses
     
-    # === METODI MANCANTI REINSERITI ===
+    # ==========================================================
+    # === METODI DI ROUTING DEI GRADIENTI (FROZEN/UNFROZEN) ===
+    # ==========================================================
+
+    # === 1. GESTIONE DETECTOR (RPN e RoI Base di Faster R-CNN) ===
     def freeze_detection(self):
-        for p in self.backbone.parameters(): p.requires_grad = False
-        for p in self.detector.parameters(): p.requires_grad = False
-        
+        # Blocchiamo in modo chirurgico SOLO l'RPN e la testa di detection, NON il backbone!
+        for p in self.detector.rpn.parameters(): p.requires_grad = False
+        for p in self.detector.roi_heads.parameters(): p.requires_grad = False
+
     def unfreeze_detection(self):
-        for p in self.backbone.parameters(): p.requires_grad = True
-        for p in self.detector.parameters(): p.requires_grad = True
-        
-    def freeze_attr_heads(self):
-        for p in self.attr_features.parameters(): p.requires_grad = False
+        for p in self.detector.rpn.parameters(): p.requires_grad = True
+        for p in self.detector.roi_heads.parameters(): p.requires_grad = True
+
+    # === 2. GESTIONE TESTA DI CLASSIFICAZIONE (FUSAR) ===
+    def freeze_cls_head(self):
+        for p in self.cls_features.parameters(): p.requires_grad = False
         for p in self.cls_head.parameters(): p.requires_grad = False
-        for p in self.reg_head.parameters(): p.requires_grad = False
-        
-    def unfreeze_attr_heads(self):
-        for p in self.attr_features.parameters(): p.requires_grad = True
+
+    def unfreeze_cls_head(self):
+        for p in self.cls_features.parameters(): p.requires_grad = True
         for p in self.cls_head.parameters(): p.requires_grad = True
+
+    # === 3. GESTIONE TESTA DI REGRESSIONE/DIMENSIONI (HRSID) ===
+    def freeze_reg_head(self):
+        for p in self.reg_features.parameters(): p.requires_grad = False
+        for p in self.reg_head.parameters(): p.requires_grad = False
+
+    def unfreeze_reg_head(self):
+        for p in self.reg_features.parameters(): p.requires_grad = True
         for p in self.reg_head.parameters(): p.requires_grad = True
         
+    # === 4. GESTIONE BACKBONE ===
     def unfreeze_backbone_last_layers(self):
+        # Congela tutto il backbone di base
         for p in self.backbone.parameters(): 
             p.requires_grad = False
             
+        # Sblocca solo il blocco semantico più alto (layer4) e la FPN per adattarsi al SAR
         if hasattr(self.backbone.base_backbone, 'body') and hasattr(self.backbone.base_backbone.body, 'layer4'):
             for p in self.backbone.base_backbone.body.layer4.parameters(): p.requires_grad = True
                 
         if hasattr(self.backbone.base_backbone, 'fpn'):
             for p in self.backbone.base_backbone.fpn.parameters(): p.requires_grad = True
                 
+        # Sblocca i moduli di Attenzione Spaziale (CCA)
         if hasattr(self.backbone, 'cca_modules'):
             for p in self.backbone.cca_modules.parameters(): p.requires_grad = True
             
-        # NUOVO: Sblocchiamo anche la FPN Bidirezionale!
+        # Sblocca la Feature Pyramid Bidirezionale (BottomUpPath)
         if hasattr(self.backbone, 'bottom_up'):
             for p in self.backbone.bottom_up.parameters(): p.requires_grad = True

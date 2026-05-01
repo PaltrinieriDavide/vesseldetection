@@ -47,16 +47,23 @@ def setup_logging(log_dir):
     return logger
 
 class EarlyStopping:
-    def __init__(self, patience=10, min_delta=0.0):
+    def __init__(self, patience=10, min_delta=0.0, mode='max'):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
-        self.best_loss = float('inf')
+        self.mode = mode
+        # Se cerchiamo il massimo (es. F1), partiamo da -infinito
+        self.best_score = float('inf') if mode == 'min' else -float('inf')
         self.early_stop = False
 
-    def __call__(self, val_loss):
-        if val_loss < self.best_loss - self.min_delta:
-            self.best_loss = val_loss
+    def __call__(self, current_score):
+        if self.mode == 'min':
+            is_better = current_score < self.best_score - self.min_delta
+        else:
+            is_better = current_score > self.best_score + self.min_delta
+
+        if is_better:
+            self.best_score = current_score
             self.counter = 0
         else:
             self.counter += 1
@@ -234,11 +241,11 @@ def setup_phase(model, phase_config, logger, dataset):
 
     # 1. Gestione Backbone
     if dataset == 'fusar':
-        # FASE 2: Sblocca SOLO Layer4 e FPN come hai suggerito!
+        # FASE 2: Sblocca SOLO Layer4 e FPN per non distruggere le feature di base
         model.unfreeze_backbone_last_layers()
         logger.info("Backbone: Partially Unfrozen (Only Layer4 & FPN)")
     elif phase_config.get('freeze_backbone', False):
-        # Congela tutto (es. se vuoi fare test)
+        # Congela tutto (es. se vuoi fare test o fine-tuning leggero)
         for p in model.backbone.parameters(): p.requires_grad = False
         logger.info("Backbone: Fully Frozen")
     else:
@@ -248,21 +255,42 @@ def setup_phase(model, phase_config, logger, dataset):
 
     # 2. Gestione Detector (RPN)
     if phase_config.get('freeze_detection', False) or dataset == 'fusar':
-        # IMPORTANTE: In Fase 2 blocchiamo anche la detection, altrimenti FUSAR
-        # (che non ha bbox) distruggerebbe la capacità di trovare le navi.
+        # IMPORTANTE: In Fase 2 blocchiamo la detection. FUSAR non ha bounding box 
+        # e rovinerebbe la capacità della rete di trovare le navi.
         model.freeze_detection()
         logger.info("Detector: Frozen")
     else:
         model.unfreeze_detection()
         logger.info("Detector: Unfrozen")
 
-    # 3. Gestione Head Classificazione/Regressione
-    if phase_config.get('freeze_classification', False) and phase_config.get('freeze_regression', False):
-        model.freeze_attr_heads()
-        logger.info("Attribute Heads: Frozen")
-    else:
-        model.unfreeze_attr_heads()
-        logger.info("Attribute Heads: Unfrozen")
+    # 3. Gestione Head Classificazione/Regressione (Decoupled Heads)
+    if dataset == 'hrsid':
+        # FASE 1: Addestriamo solo Box e Dimensioni. Blocchiamo il ramo Classificazione.
+        model.unfreeze_reg_head()
+        model.freeze_cls_head()
+        logger.info("Attribute Heads: Regression UNFROZEN, Classification FROZEN")
+        
+    elif dataset == 'fusar':
+        # FASE 2: Addestriamo solo Classificazione. Proteggiamo la precisione spaziale di HRSID.
+        model.freeze_reg_head()
+        model.unfreeze_cls_head()
+        logger.info("Attribute Heads: Regression FROZEN, Classification UNFROZEN")
+        
+    elif dataset == 'combined':
+        # FASE 3: Multi-task finale. Controlliamo cosa dice il config.json
+        if phase_config.get('freeze_classification', False):
+            model.freeze_cls_head()
+            logger.info("Attribute Heads: Classification FROZEN")
+        else:
+            model.unfreeze_cls_head()
+            logger.info("Attribute Heads: Classification UNFROZEN")
+            
+        if phase_config.get('freeze_regression', False):
+            model.freeze_reg_head()
+            logger.info("Attribute Heads: Regression FROZEN")
+        else:
+            model.unfreeze_reg_head()
+            logger.info("Attribute Heads: Regression UNFROZEN")
 
 def main():
     parser = argparse.ArgumentParser()

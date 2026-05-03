@@ -69,7 +69,7 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-
+                
 class MetricsTracker:
     def __init__(self, phase_name='det_reg'):
         self.phase_name = phase_name
@@ -353,16 +353,26 @@ def main():
 
                 if task in ['cls', 'multi']:
                     writer.add_scalar(f'Metrics/{phase_name}/Accuracy', val_m['accuracy'], global_epoch_counter)
-
-                # --- LOG TERMINALE ---
+                    
+                
                 if task == 'det_reg':
                     logger.info(f"VAL Epoch {epoch} | Loss: {val_m['loss_total']:.4f} | IoU: {val_m['iou']:.4f} | Prec: {val_m['precision']:.4f} | F1: {val_m['f1']:.4f} | MAPE_L: {val_m['mape_length']:.2f}% | MAPE_W: {val_m['mape_width']:.2f}%")
+                    # Score = F1 + IoU (Garantisce che troviamo la nave E che la misuriamo bene)
+                    target_score = val_m['f1'] + val_m['iou']
+                
                 elif task == 'cls':
                     logger.info(f"VAL Epoch {epoch} | Loss: {val_m['loss_total']:.4f} | Acc: {val_m['accuracy']:.4f}")
-                else:
+                    # Score = Accuracy pura
+                    target_score = val_m['accuracy']
+                
+                else: # 'multi'
                     logger.info(f"VAL Epoch {epoch} | Loss: {val_m['loss_total']:.4f} | IoU: {val_m['iou']:.4f} | Prec: {val_m['precision']:.4f} | F1: {val_m['f1']:.4f} | Acc: {val_m['accuracy']:.4f} | MAPE_L: {val_m['mape_length']:.2f}%")
+                    # Score bilanciato tra Detection e Classificazione
+                    target_score = (val_m['f1'] + val_m['accuracy']) / 2.0
 
-                early_stopping(val_m['loss_total'])
+                # Salvataggio basato sulle METRICHE REALI, non sulla loss!
+                early_stopping(target_score)
+                
                 if early_stopping.counter == 0:
                     torch.save(model.state_dict(), checkpoint_dir / f'best_{dataset}.pt')
                     logger.info("    [!] New Best Model Saved!")

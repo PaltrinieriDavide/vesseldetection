@@ -1,21 +1,58 @@
-# train.py
 import torch
 import torch.optim as optim
 import json
 import logging
+import re
 from pathlib import Path
 from datetime import datetime
 import argparse
 import numpy as np
 from collections import defaultdict
 from torchvision.ops import box_iou
-from torch.utils.tensorboard import SummaryWriter  # Aggiunto TensorBoard
+from torch.utils.tensorboard import SummaryWriter
 
 from architecture.model import HybridVesselModel
 from data import create_dataloaders
 
 ACCUMULATION_STEPS = 32
 GRAD_CLIP = 1.0
+
+def get_resolution_from_filename(filename):
+    match = re.search(r'P(\d{4})', filename)
+    if match:
+        num = int(match.group(1))
+        if num in [124, 125, 130, 131]:
+            return 0.5
+        elif num in [123, 128]:
+            return 1.0
+        elif (1 <= num <= 122) or num in [126, 127, 129] or (132 <= num <= 136):
+            return 3.0
+    return 3.0
+
+def build_ground_truth_map(config):
+    gt_map = {}
+    json_paths = [
+        config.get('paths', {}).get('hrsid_val_json', ''),
+        config.get('paths', {}).get('fusar_val_json', '')
+    ]
+    for jp in json_paths:
+        if not jp: continue
+        p = Path(jp)
+        if p.exists():
+            with open(p, 'r') as f:
+                data = json.load(f)
+            img_dict = {img['id']: img.get('file_name', '') for img in data.get('images', [])}
+            for ann in data.get('annotations', []):
+                img_id = ann['image_id']
+                if img_id not in gt_map:
+                    gt_map[img_id] = {'filename': img_dict.get(img_id, ''), 'anns': []}
+                gt_map[img_id]['anns'].append({
+                    'l_m': float(ann.get('length', 0)),
+                    'w_m': float(ann.get('width', 0)),
+                    'l_p': float(ann.get('length_pixel', 0)),
+                    'w_p': float(ann.get('width_pixel', 0))
+                })
+    return gt_map
 
 def setup_logging(log_dir):
     log_dir = Path(log_dir)
@@ -25,23 +62,16 @@ def setup_logging(log_dir):
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
 
-    # Rimuove gli handler precedenti se esistono (evita la doppia stampa)
     if logger.hasHandlers():
         logger.handlers.clear()
 
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-    # Handler per il file
     fh = logging.FileHandler(log_file)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
-
-    # Handler per il terminale
     sh = logging.StreamHandler()
     sh.setFormatter(formatter)
     logger.addHandler(sh)
-
-    # Impedisce la propagazione al root logger (altra causa di doppia stampa)
     logger.propagate = False
 
     return logger
@@ -52,7 +82,6 @@ class EarlyStopping:
         self.min_delta = min_delta
         self.counter = 0
         self.mode = mode
-        # Se cerchiamo il massimo (es. F1), partiamo da -infinito
         self.best_score = float('inf') if mode == 'min' else -float('inf')
         self.early_stop = False
 
@@ -71,16 +100,20 @@ class EarlyStopping:
                 self.early_stop = True
                 
 class MetricsTracker:
-    def __init__(self, phase_name='det_reg'):
+    def __init__(self, phase_name='det_reg', gt_map=None):
         self.phase_name = phase_name
+        self.gt_map = gt_map or {}
         self.reset()
 
     def reset(self):
         self.losses = defaultdict(list)
         self.accuracies, self.mape_widths, self.mape_lengths, self.ious = [], [], [], []
-        self.num_samples = 0
+        self.mae_widths_pixel, self.mae_lengths_pixel = [], []
+        
+        self.correct_per_class = defaultdict(int)
+        self.total_per_class = defaultdict(int)
 
-        # Metriche per Detection F1 e Precision
+        self.num_samples = 0
         self.tp = 0
         self.fp = 0
         self.fn = 0
@@ -92,19 +125,34 @@ class MetricsTracker:
         self.num_samples += len(targets)
         if not out_dict: return
 
-        # === 1. Detection (IoU, Precision, Recall, F1) ===
+        # === 1. Detection (IoU, Precision, Recall, F1, e Pixel in Validation) ===
         if task in ['det_reg', 'multi'] and 'detections' in out_dict:
-            for p, t in zip(out_dict['detections'], targets):
+            idx = 0
+            for i, (p, t) in enumerate(zip(out_dict['detections'], targets)):
+                # Contiamo quante box sono state usate per la predizione in questo forward
+                b_forward = out_dict['boxes'][i]
+                n_forward_boxes = b_forward.shape[0] if b_forward.numel() > 0 else 0
+
                 if 'boxes' in t:
                     gt_boxes = t['boxes']
                     keep_idx = p['scores'] > 0.5
                     pred_boxes = p['boxes'][keep_idx]
 
+                    # Calcoliamo le metriche pixel SOLO SE siamo in validazione
+                    # (cioè quando il modello valuta le dimensioni sulle detection stesse, non sulle GT)
+                    can_do_pixel = False
+                    if 'dimensions' in t and 'dimensions' in out_dict and n_forward_boxes == len(p['boxes']):
+                        raw_dims = out_dict['dimensions'][idx : idx + n_forward_boxes]
+                        pred_dims = raw_dims[keep_idx]
+                        can_do_pixel = True
+
                     if len(gt_boxes) == 0:
                         self.fp += len(pred_boxes)
+                        idx += n_forward_boxes
                         continue
                     if len(pred_boxes) == 0:
                         self.fn += len(gt_boxes)
+                        idx += n_forward_boxes
                         continue
 
                     if len(p['boxes']) > 0 and len(gt_boxes) > 0:
@@ -118,27 +166,75 @@ class MetricsTracker:
                         if best_iou > 0.5 and best_gt.item() not in matched_gt:
                             self.tp += 1
                             matched_gt.add(best_gt.item())
+                            
+                            # --- Calcolo MAE in Pixel (SOLO in Validazione per i True Positives) ---
+                            if can_do_pixel and self.gt_map:
+                                img_id = t.get('image_id', None)
+                                if isinstance(img_id, torch.Tensor): img_id = img_id.item()
+                                
+                                pr_l, pr_w = pred_dims[pred_idx].detach().cpu().numpy()
+                                gt_l, gt_w = t['dimensions'][best_gt.item()].cpu().numpy()
+                                
+                                best_json_ann = None
+                                if img_id is not None and img_id in self.gt_map:
+                                    anns = self.gt_map[img_id]['anns']
+                                    target_idx = best_gt.item()
+                                    if target_idx < len(anns):
+                                        best_json_ann = anns[target_idx]
+                                        true_ratio = best_json_ann['l_m'] / max(best_json_ann['w_m'], 1e-6)
+                                        pred_ratio = float(gt_l) / max(float(gt_w), 1e-6)
+                                        if abs(true_ratio - pred_ratio) > 0.5:
+                                            min_diff = float('inf')
+                                            for ann in anns:
+                                                tr = ann['l_m'] / max(ann['w_m'], 1e-6)
+                                                diff = abs(tr - pred_ratio)
+                                                if diff < min_diff:
+                                                    min_diff, best_json_ann = diff, ann
+                                                    
+                                if best_json_ann and best_json_ann['l_m'] > 0:
+                                    true_l_m = best_json_ann['l_m']
+                                    true_w_m = best_json_ann['w_m']
+                                    filename = self.gt_map[img_id]['filename']
+                                    res = get_resolution_from_filename(filename)
+                                    
+                                    true_l_p = best_json_ann['l_p'] if best_json_ann['l_p'] > 0 else true_l_m / res
+                                    true_w_p = best_json_ann['w_p'] if best_json_ann['w_p'] > 0 else true_w_m / res
+                                    
+                                    scale_l = true_l_m / max(float(gt_l), 1e-6)
+                                    scale_w = true_w_m / max(float(gt_w), 1e-6)
+                                    
+                                    pr_l_meters = pr_l * scale_l
+                                    pr_w_meters = pr_w * scale_w
+                                    
+                                    pr_l_px = pr_l_meters / res
+                                    pr_w_px = pr_w_meters / res
+                                    
+                                    self.mae_lengths_pixel.append(np.abs(true_l_p - pr_l_px))
+                                    self.mae_widths_pixel.append(np.abs(true_w_p - pr_w_px))
+                            # -----------------------------------------------------------------------
+
                         else:
                             self.fp += 1
 
                     self.fn += len(gt_boxes) - len(matched_gt)
+                idx += n_forward_boxes
 
         # === 2. Classificazione (FUSAR) e Regressione (HRSID) ===
+        # QUI E' ESATTAMENTE COME NELLA TUA VERSIONE ORIGINALE (ho aggiunto solo l'accuracy per classe)
         if task in ['cls', 'det_reg', 'multi']:
             valid_cls_preds, valid_cls_targs = [], []
             valid_reg_preds, valid_reg_targs = [], []
             idx = 0
 
             for i, t in enumerate(targets):
-                # FIX CRITICO: Contiamo quante BBox sono state *effettivamente* passate al ROI Align
                 b = out_dict['boxes'][i]
                 num_preds = b.shape[0] if b.numel() > 0 else 0
 
                 if num_preds > 0:
-                    if 'category_id' in t: # FUSAR
+                    if 'category_id' in t: 
                         valid_cls_preds.append(out_dict['logits'][idx:idx+num_preds])
                         valid_cls_targs.append(t['category_id'].repeat(num_preds))
-                    if 'dimensions' in t: # HRSID
+                    if 'dimensions' in t: 
                         valid_reg_preds.append(out_dict['dimensions'][idx:idx+num_preds])
                         valid_reg_targs.append(t['dimensions'])
 
@@ -148,6 +244,11 @@ class MetricsTracker:
                 preds_cls = torch.argmax(torch.cat(valid_cls_preds), dim=1).cpu().numpy()
                 true_cls = torch.cat(valid_cls_targs).cpu().numpy()
                 self.accuracies.append((preds_cls == true_cls).mean())
+                
+                # Accuracy per Singola Classe
+                for p_c, t_c in zip(preds_cls, true_cls):
+                    self.correct_per_class[t_c] += (p_c == t_c)
+                    self.total_per_class[t_c] += 1
 
             if valid_reg_preds:
                 pred_dims = torch.cat(valid_reg_preds).detach().cpu().numpy()
@@ -156,7 +257,8 @@ class MetricsTracker:
                 mape_w = np.mean(np.abs(true_dims[:, 1] - pred_dims[:, 1]) / (true_dims[:, 1] + 1e-6)) * 100
                 self.mape_lengths.append(min(mape_l, 1000.0))
                 self.mape_widths.append(min(mape_w, 1000.0))
-
+                
+                
     def get_avg_metrics(self):
         metrics = {k: np.mean(v) if v else 0.0 for k, v in self.losses.items()}
         metrics['loss_total'] = sum(metrics.values())
@@ -164,6 +266,15 @@ class MetricsTracker:
         metrics['mape_length'] = np.mean(self.mape_lengths) if self.mape_lengths else 0.0
         metrics['mape_width'] = np.mean(self.mape_widths) if self.mape_widths else 0.0
         metrics['iou'] = np.mean(self.ious) if self.ious else 0.0
+
+        if self.mae_lengths_pixel:
+            metrics['mae_length_pixel'] = np.mean(self.mae_lengths_pixel)
+            metrics['mae_width_pixel'] = np.mean(self.mae_widths_pixel)
+
+        # Accuracy per classe
+        for cls_idx in self.total_per_class.keys():
+            if self.total_per_class[cls_idx] > 0:
+                metrics[f'acc_cls_{cls_idx}'] = self.correct_per_class[cls_idx] / self.total_per_class[cls_idx]
 
         precision = self.tp / (self.tp + self.fp) if (self.tp + self.fp) > 0 else 0.0
         recall = self.tp / (self.tp + self.fn) if (self.tp + self.fn) > 0 else 0.0
@@ -175,9 +286,9 @@ class MetricsTracker:
 
         return metrics
 
-def train_epoch(model, dataloader, optimizer, scaler, device, log_interval, epoch, logger, task):
+def train_epoch(model, dataloader, optimizer, scaler, device, log_interval, epoch, logger, task, gt_map=None):
     model.train()
-    metrics = MetricsTracker(phase_name=task)
+    metrics = MetricsTracker(phase_name=task, gt_map=gt_map)
     optimizer.zero_grad()
 
     for batch_idx, (images, targets) in enumerate(dataloader):
@@ -186,7 +297,6 @@ def train_epoch(model, dataloader, optimizer, scaler, device, log_interval, epoc
 
         with torch.autocast(device_type='cuda'):
             out, losses = model(images, targets_gpu, phase=task)
-
             if len(losses) == 0: continue
             loss = sum(l for l in losses.values()) / ACCUMULATION_STEPS
 
@@ -213,9 +323,9 @@ def train_epoch(model, dataloader, optimizer, scaler, device, log_interval, epoc
     return metrics.get_avg_metrics()
 
 @torch.no_grad()
-def val_epoch(model, dataloader, device, epoch, logger, task):
+def val_epoch(model, dataloader, device, epoch, logger, task, gt_map=None):
     model.train()
-    loss_tracker = MetricsTracker(phase_name=task)
+    loss_tracker = MetricsTracker(phase_name=task, gt_map=gt_map)
     for images, targets in dataloader:
         images = [im.to(device) for im in images]
         targets_gpu = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
@@ -224,7 +334,7 @@ def val_epoch(model, dataloader, device, epoch, logger, task):
             if losses: loss_tracker.update(losses, {}, targets_gpu, task)
 
     model.eval()
-    metric_tracker = MetricsTracker(phase_name=task)
+    metric_tracker = MetricsTracker(phase_name=task, gt_map=gt_map)
     for images, targets in dataloader:
         images = [im.to(device) for im in images]
         targets_gpu = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
@@ -233,51 +343,39 @@ def val_epoch(model, dataloader, device, epoch, logger, task):
             metric_tracker.update({}, preds, targets_gpu, task)
 
     res = loss_tracker.get_avg_metrics()
-    res.update({k: v for k, v in metric_tracker.get_avg_metrics().items() if k in ['iou', 'accuracy', 'mape_length', 'mape_width', 'precision', 'f1']})
+    metric_res = metric_tracker.get_avg_metrics()
+    # Aggiungi tutte le metriche rilevanti
+    res.update({k: v for k, v in metric_res.items() if k in ['iou', 'accuracy', 'mape_length', 'mape_width', 'precision', 'recall', 'f1', 'mae_length_pixel', 'mae_width_pixel'] or k.startswith('acc_cls_')})
     return res
 
 def setup_phase(model, phase_config, logger, dataset):
     logger.info(f"\n{'='*80}\nPHASE SETUP: {phase_config['name']} ({dataset.upper()})\n{'='*80}")
-
-    # 1. Gestione Backbone
     if dataset == 'fusar':
-        # FASE 2: Sblocca SOLO Layer4 e FPN per non distruggere le feature di base
         model.unfreeze_backbone_last_layers()
         logger.info("Backbone: Partially Unfrozen (Only Layer4 & FPN)")
     elif phase_config.get('freeze_backbone', False):
-        # Congela tutto (es. se vuoi fare test o fine-tuning leggero)
         for p in model.backbone.parameters(): p.requires_grad = False
         logger.info("Backbone: Fully Frozen")
     else:
-        # Fase 1 o 3: Sblocca tutto
         for p in model.backbone.parameters(): p.requires_grad = True
         logger.info("Backbone: Fully Unfrozen")
 
-    # 2. Gestione Detector (RPN)
     if phase_config.get('freeze_detection', False) or dataset == 'fusar':
-        # IMPORTANTE: In Fase 2 blocchiamo la detection. FUSAR non ha bounding box 
-        # e rovinerebbe la capacità della rete di trovare le navi.
         model.freeze_detection()
         logger.info("Detector: Frozen")
     else:
         model.unfreeze_detection()
         logger.info("Detector: Unfrozen")
 
-    # 3. Gestione Head Classificazione/Regressione (Decoupled Heads)
     if dataset == 'hrsid':
-        # FASE 1: Addestriamo solo Box e Dimensioni. Blocchiamo il ramo Classificazione.
         model.unfreeze_reg_head()
         model.freeze_cls_head()
         logger.info("Attribute Heads: Regression UNFROZEN, Classification FROZEN")
-        
     elif dataset == 'fusar':
-        # FASE 2: Addestriamo solo Classificazione. Proteggiamo la precisione spaziale di HRSID.
         model.freeze_reg_head()
         model.unfreeze_cls_head()
         logger.info("Attribute Heads: Regression FROZEN, Classification UNFROZEN")
-        
     elif dataset == 'combined':
-        # FASE 3: Multi-task finale. Controlliamo cosa dice il config.json
         if phase_config.get('freeze_classification', False):
             model.freeze_cls_head()
             logger.info("Attribute Heads: Classification FROZEN")
@@ -302,8 +400,9 @@ def main():
 
     logger = setup_logging(config['paths']['logs_dir'])
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    
+    gt_map = build_ground_truth_map(config)
 
-    # Inizializzazione TensorBoard
     tb_dir = Path(config['paths']['logs_dir']) / f"tensorboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     tb_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(tb_dir))
@@ -317,7 +416,7 @@ def main():
     scaler = torch.cuda.amp.GradScaler()
     patience = config.get('common_training', {}).get('early_stopping_patience', 10)
 
-    global_epoch_counter = 0 # Contatore per un grafico TB continuo
+    global_epoch_counter = 0
 
     for phase_name, phase_config in config['training_phases'].items():
         dataset = phase_config['dataset']
@@ -331,46 +430,58 @@ def main():
         for epoch in range(1, phase_config['num_epochs'] + 1):
             global_epoch_counter += 1
 
-            train_m = train_epoch(model, dataloaders[f'train_{dataset}'], optimizer, scaler, device, config['common_training']['log_interval'], epoch, logger, task)
+            train_m = train_epoch(model, dataloaders[f'train_{dataset}'], optimizer, scaler, device, config['common_training']['log_interval'], epoch, logger, task, gt_map)
 
             if epoch % config['common_training']['val_interval'] == 0:
-                val_m = val_epoch(model, dataloaders[f'val_{dataset}'], device, epoch, logger, task)
+                val_m = val_epoch(model, dataloaders[f'val_{dataset}'], device, epoch, logger, task, gt_map)
 
-                # --- LOG TENSORBOARD ---
-                # Loss comparata (Train vs Val)
                 writer.add_scalars(f'Loss/{phase_name}', {
                     'Train': train_m['loss_total'],
                     'Val': val_m['loss_total']
                 }, global_epoch_counter)
 
-                # Altre metriche in base al task
                 if task in ['det_reg', 'multi']:
-                    writer.add_scalar(f'Metrics/{phase_name}/IoU', val_m['iou'], global_epoch_counter)
-                    writer.add_scalar(f'Metrics/{phase_name}/F1', val_m['f1'], global_epoch_counter)
-                    writer.add_scalar(f'Metrics/{phase_name}/Precision', val_m['precision'], global_epoch_counter)
-                    writer.add_scalar(f'Metrics/{phase_name}/MAPE_L', val_m['mape_length'], global_epoch_counter)
-                    writer.add_scalar(f'Metrics/{phase_name}/MAPE_W', val_m['mape_width'], global_epoch_counter)
+                    writer.add_scalar(f'Metrics/{phase_name}/IoU', val_m.get('iou', 0), global_epoch_counter)
+                    writer.add_scalar(f'Metrics/{phase_name}/F1', val_m.get('f1', 0), global_epoch_counter)
+                    writer.add_scalar(f'Metrics/{phase_name}/Precision', val_m.get('precision', 0), global_epoch_counter)
+                    writer.add_scalar(f'Metrics/{phase_name}/Recall', val_m.get('recall', 0), global_epoch_counter)
+                    writer.add_scalar(f'Metrics/{phase_name}/MAPE_L', val_m.get('mape_length', 0), global_epoch_counter)
+                    writer.add_scalar(f'Metrics/{phase_name}/MAPE_W', val_m.get('mape_width', 0), global_epoch_counter)
+                    if 'mae_length_pixel' in val_m:
+                        writer.add_scalar(f'Metrics/{phase_name}/MAE_L_px', val_m.get('mae_length_pixel', 0), global_epoch_counter)
+                        writer.add_scalar(f'Metrics/{phase_name}/MAE_W_px', val_m.get('mae_width_pixel', 0), global_epoch_counter)
 
                 if task in ['cls', 'multi']:
-                    writer.add_scalar(f'Metrics/{phase_name}/Accuracy', val_m['accuracy'], global_epoch_counter)
+                    writer.add_scalar(f'Metrics/{phase_name}/Accuracy', val_m.get('accuracy', 0), global_epoch_counter)
+                    for k, v in val_m.items():
+                        if k.startswith('acc_cls_'):
+                            writer.add_scalar(f'Metrics/{phase_name}/Class_Accuracy/{k}', v, global_epoch_counter)
                     
-                
                 if task == 'det_reg':
-                    logger.info(f"VAL Epoch {epoch} | Loss: {val_m['loss_total']:.4f} | IoU: {val_m['iou']:.4f} | Prec: {val_m['precision']:.4f} | F1: {val_m['f1']:.4f} | MAPE_L: {val_m['mape_length']:.2f}% | MAPE_W: {val_m['mape_width']:.2f}%")
-                    # Score = F1 + IoU (Garantisce che troviamo la nave E che la misuriamo bene)
+                    log_str = f"VAL Epoch {epoch} | Loss: {val_m['loss_total']:.4f} | IoU: {val_m['iou']:.4f} | Prec: {val_m['precision']:.4f} | Rec: {val_m['recall']:.4f} | F1: {val_m['f1']:.4f} | MAPE_L: {val_m['mape_length']:.2f}% | MAPE_W: {val_m['mape_width']:.2f}%"
+                    if 'mae_length_pixel' in val_m:
+                        log_str += f" | MAE_L_px: {val_m['mae_length_pixel']:.2f} | MAE_W_px: {val_m['mae_width_pixel']:.2f}"
+                    logger.info(log_str)
                     target_score = val_m['f1'] + val_m['iou']
                 
                 elif task == 'cls':
-                    logger.info(f"VAL Epoch {epoch} | Loss: {val_m['loss_total']:.4f} | Acc: {val_m['accuracy']:.4f}")
-                    # Score = Accuracy pura
+                    acc_str = f"VAL Epoch {epoch} | Loss: {val_m['loss_total']:.4f} | Acc: {val_m['accuracy']:.4f}"
+                    for k, v in val_m.items():
+                        if k.startswith('acc_cls_'):
+                            acc_str += f" | {k}: {v:.4f}"
+                    logger.info(acc_str)
                     target_score = val_m['accuracy']
                 
-                else: # 'multi'
-                    logger.info(f"VAL Epoch {epoch} | Loss: {val_m['loss_total']:.4f} | IoU: {val_m['iou']:.4f} | Prec: {val_m['precision']:.4f} | F1: {val_m['f1']:.4f} | Acc: {val_m['accuracy']:.4f} | MAPE_L: {val_m['mape_length']:.2f}%")
-                    # Score bilanciato tra Detection e Classificazione
+                else: 
+                    log_str = f"VAL Epoch {epoch} | Loss: {val_m['loss_total']:.4f} | F1: {val_m['f1']:.4f} | Rec: {val_m['recall']:.4f} | Acc: {val_m['accuracy']:.4f}"
+                    if 'mae_length_pixel' in val_m:
+                        log_str += f" | MAE_L_px: {val_m['mae_length_pixel']:.2f} | MAE_W_px: {val_m['mae_width_pixel']:.2f}"
+                    for k, v in val_m.items():
+                        if k.startswith('acc_cls_'):
+                            log_str += f" | {k}: {v:.4f}"
+                    logger.info(log_str)
                     target_score = (val_m['f1'] + val_m['accuracy']) / 2.0
 
-                # Salvataggio basato sulle METRICHE REALI, non sulla loss!
                 early_stopping(target_score)
                 
                 if early_stopping.counter == 0:
@@ -380,7 +491,6 @@ def main():
                     logger.info("    [!] Early stopping triggered.")
                     break
             else:
-                # Logga almeno la train loss anche se non si fa validazione a questo step
                 writer.add_scalars(f'Loss/{phase_name}', {'Train': train_m['loss_total']}, global_epoch_counter)
 
             scheduler.step()
@@ -391,7 +501,7 @@ def main():
 
     torch.save(model.state_dict(), checkpoint_dir / "final_hybrid_model.pt")
     logger.info("TRAINING COMPLETE!")
-    writer.close() # Chiude TensorBoard
+    writer.close()
 
 if __name__ == '__main__':
     main()

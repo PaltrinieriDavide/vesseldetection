@@ -1,3 +1,0 @@
-ssh it4i-dpaltri@login1.karolina.it4i.cz -p 22 -i /root/dark-vessel-paltrinieri/HRSID_pipeline/id_ed25519
-
-cd /mnt/proj3/eu-26-25

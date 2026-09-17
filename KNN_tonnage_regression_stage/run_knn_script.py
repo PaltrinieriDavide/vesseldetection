@@ -24,17 +24,14 @@ import categorical_distances_calculators as categorical_distances_calculators
 
 import visualization
 
-#########################################################
-#PROVA DI PLOT DELLE DISTRIBUZIONI DEL TARGET PER OGNI CLASSE
-
 def analyze_and_plot_performance(y_test, y_pred, X_test, class_mapping, train_counts, metric_name):
     """
     Analyzes error metrics per class and generates professional visualization plots.
     """
-    # Create an inverse mapping for labels
+    
     inv_map = {v: k for k, v in class_mapping.items()}
     
-    # Prepare results DataFrame
+    
     results_df = pd.DataFrame({
         'True_Value': y_test.values if hasattr(y_test, 'values') else y_test,
         'Predicted_Value': y_pred,
@@ -44,7 +41,7 @@ def analyze_and_plot_performance(y_test, y_pred, X_test, class_mapping, train_co
     results_df['Abs_Error'] = np.abs(results_df['True_Value'] - results_df['Predicted_Value'])
     results_df['APE'] = (results_df['Abs_Error'] / results_df['True_Value']) * 100
 
-    # Aggregate metrics by class
+    
     class_metrics = results_df.groupby('Class_Name').agg(
         Mean_APE=('APE', 'mean'),
         Median_APE=('APE', 'median'),
@@ -52,20 +49,20 @@ def analyze_and_plot_performance(y_test, y_pred, X_test, class_mapping, train_co
         Test_Samples=('Abs_Error', 'count')
     ).reset_index()
 
-    # Integrate training representation data
+    
     train_counts_df = train_counts.to_frame().reset_index()
     train_counts_df.columns = ['Class_Name', 'Train_Samples']
     class_metrics = class_metrics.merge(train_counts_df, on='Class_Name')
 
     print("\n" + "="*50)
-    print(f"PERFORMANCE ANALYSIS PER CLASS (Metric: {metric_name})")
+    print(f"PER-CLASS PERFORMANCE ANALYSIS (Metric: {metric_name})")
     print("="*50)
     print(class_metrics.sort_values(by='Mean_APE', ascending=False).to_string(index=False))
 
-    # Create directories for results
+    
     os.makedirs("results/plots", exist_ok=True)
 
-    # PLOT 1: Error Distribution (Boxplot)
+    
     plt.figure(figsize=(14, 7))
     sns.boxplot(data=results_df, x='Class_Name', y='APE', palette='viridis', hue='Class_Name', legend=False)
     plt.yscale('log')
@@ -78,7 +75,7 @@ def analyze_and_plot_performance(y_test, y_pred, X_test, class_mapping, train_co
     plt.savefig(f"results/plots/error_distribution_{metric_name}.png", dpi=300)
     plt.show()
 
-    # PLOT 2: Error vs. Representation (Dual Axis)
+    
     fig, ax1 = plt.subplots(figsize=(14, 7))
     ax2 = ax1.twinx()
     
@@ -98,13 +95,6 @@ def analyze_and_plot_performance(y_test, y_pred, X_test, class_mapping, train_co
     plt.show()
 
     return class_metrics
-
-##########################################################
-
-
-
-
-
 
 
 
@@ -157,8 +147,8 @@ def create_balanced_subset(train_df: pd.DataFrame, categorical_feature: str, tar
 
     balanced_df = pd.concat(balanced_dfs)
     
-    logging.info(f"Downsampling completed --> Shape: {balanced_df.shape}")
-    logging.info(f"Balanced dataset distribution:\n{balanced_df[categorical_feature].value_counts()}")
+    logging.info(f"Class balancing completed; resulting shape: {balanced_df.shape}")
+    logging.info(f"Balanced dataset class distribution:\n{balanced_df[categorical_feature].value_counts()}")
     
     return balanced_df
 
@@ -166,9 +156,9 @@ def create_balanced_subset(train_df: pd.DataFrame, categorical_feature: str, tar
 def load_and_prepare_data(file_path: str):
     try:
         df = pd.read_csv(file_path)
-        logging.info(f"Dataset '{file_path}' loaded. Shape: {df.shape}")
+        logging.info(f"Loaded dataset '{file_path}'; shape: {df.shape}")
     except FileNotFoundError:
-        logging.error(f"Error: File '{file_path}' not found.")
+        logging.error(f"Dataset file not found: '{file_path}'.")
         raise
     
     le = LabelEncoder()
@@ -176,7 +166,7 @@ def load_and_prepare_data(file_path: str):
     
     class_mapping = dict(zip(le.classes_, le.transform(le.classes_)))
     
-    logging.info(f"Class mapping: {class_mapping}")
+    logging.info(f"Class label mapping: {class_mapping}")
     
     return df, class_mapping
 
@@ -191,7 +181,7 @@ def preprocessing_phase(df, class_mapping, metric):
     X = df[numerical_features + [categorical_feature]]
     y = df['Tonnage']
     
-    print(f"Dataset shape: {df.head}")
+    print(f"Dataset preview: {df.head}")
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
@@ -199,9 +189,9 @@ def preprocessing_phase(df, class_mapping, metric):
     
     balanced_train_subset = create_balanced_subset(train_df, categorical_feature, target_variable)
     
-    #visualization.plot_target_distributions_by_class(train_df, categorical_feature, target_variable, class_mapping)
     
-    logging.info(f"Calculating distance matrix using metric: {metric}")
+    
+    logging.info(f"Calculating the distance matrix with metric: {metric}")
     calculator_params = {
         "numerical_features": numerical_features,
         "categorical_feature": categorical_feature,
@@ -221,14 +211,14 @@ def preprocessing_phase(df, class_mapping, metric):
 
     calculator = categorical_distances_calculators.get_calculator(metric, **calculator_params)
     
-    cat_dist_matrix = calculator.calculate(train_df) #balanced_train_subset
+    cat_dist_matrix = calculator.calculate(train_df) 
     
     visualization.create_heatmap(cat_dist_matrix, class_mapping, metric)
     
-    logging.info(f"Calculated distance matrix:\n{np.round(cat_dist_matrix, 2)}")
-    print(f"\nCalculated '{metric}' distance matrix:\n", np.round(cat_dist_matrix, 2))
+    logging.info(f"Computed distance matrix:\n{np.round(cat_dist_matrix, 2)}")
+    print(f"\nDistance matrix for metric '{metric}':\n", np.round(cat_dist_matrix, 2))
 
-    logging.info(f"Training Samples: {X_train.shape[0]} - Test Samples: {X_test.shape[0]}")
+    logging.info(f"Training samples: {X_train.shape[0]} | Test samples: {X_test.shape[0]}")
     
     return X_train, X_test, y_train, y_test, numerical_features, categorical_feature, cat_dist_matrix
 
@@ -247,11 +237,11 @@ def main():
     parser = setup_parser()
     args = parser.parse_args()
 
-    # Setup logging
+    
     os.makedirs(os.path.dirname('results/logs/knn_logFile.log'), exist_ok=True)
     logging.basicConfig(filename='results/logs/knn_logFile.log', filemode='w', level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s')
-    logging.info(f"Starting experiment with arguments: {args}")
+    logging.info(f"Starting the experiment with arguments: {args}")
     
     try:
         df, class_mapping = load_and_prepare_data(args.dataset)
@@ -293,10 +283,10 @@ def main():
         ('model', CustomKNNRegressor(**model_init_params))
     ])
     
-    print(f"\n--- Optimizing KNN with '{args.metric}' metric ---")
+    print(f"\n--- Optimizing the KNN model with metric '{args.metric}' ---")
     grid_search = GridSearchCV(estimator=pipeline, param_grid=param_grid, cv=cv, scoring='neg_mean_absolute_percentage_error', n_jobs=-1, verbose=1)
-    #grid_search = GridSearchCV(estimator=pipeline, param_grid=param_grid, cv=cv, scoring=lambda estimator, X_val, y_val: -pd.DataFrame({"ape": np.abs(np.asarray(y_val) - estimator.predict(X_val)) / np.maximum(np.abs(np.asarray(y_val)), 1e-9), "class": X_val["Class_Name_Encoded"].values}).groupby("class")["ape"].mean().mean(), n_jobs=-1, verbose=1)
-    #grid_search = GridSearchCV(estimator=pipeline,param_grid=param_grid,cv=cv,scoring=lambda estimator, X_val, y_val: -np.average(np.abs(np.asarray(y_val) - estimator.predict(X_val)) / np.maximum(np.abs(np.asarray(y_val)), 1e-9),weights=1.0 / X_val["Class_Name_Encoded"].map(X_val["Class_Name_Encoded"].value_counts()).values),n_jobs=-1,verbose=1)
+    
+    
     grid_search.fit(X_train, y_train)
     
     
@@ -306,15 +296,10 @@ def main():
     y_pred = best_model.predict(X_test)
     
     
-    # --- AGGIUNGI DA QUI ---
-    # Calcolo dei conteggi reali delle classi (usando i nomi originali)
     inv_map = {v: k for k, v in class_mapping.items()}
     train_counts = X_train[categorical_feature].map(inv_map).value_counts()
     
-    # Chiamata alla funzione di analisi
     analyze_and_plot_performance(y_test, y_pred, X_test, class_mapping, train_counts, args.metric)
-    # --- FINE AGGIUNTA --
-    
     
     r2_test = r2_score(y_test, y_pred)
     mae_test = mean_absolute_error(y_test, y_pred)
@@ -348,24 +333,9 @@ def main():
     file_name = f"knn_model_{args.metric}.joblib"
     file_path = os.path.join("models_result", file_name)
 
-    print(f"\nSaving model and artifacts to '{file_path}'...")
+    print(f"\nSaving the model and associated artifacts to '{file_path}'...")
     joblib.dump(artifacts_to_save, file_path)
     
 
 if __name__ == '__main__':
     main()
-    
-    
-    '''
-    KNN without categorical distance matrix: ovviamente alpha = 0
-    --- Performance on Test Set ---
-    R² Score: 0.9967
-    Mean Absolute Error: 418.36 tons
-    Mean Absolute Percentage Error: 23.61%
-    
-    
-    --- Performance on Test Set ---
-    R² Score: 0.0376
-    Mean Absolute Error: 5753.93 tons
-    Mean Absolute Percentage Error: 58.18%
-    '''

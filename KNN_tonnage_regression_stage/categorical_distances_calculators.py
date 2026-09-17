@@ -68,7 +68,6 @@ class DistributionalDistanceCalculator(ABC):
         return normalized_matrix
 
 class WassersteinDistanceCalculator(DistributionalDistanceCalculator):
-    """Calculates distance based on the Wasserstein Distance (Earth Mover's Distance)."""
     def calculate(self, train_df: pd.DataFrame) -> np.ndarray:
         logger.info("Starting distance matrix calculation with Wasserstein...")
         dist_matrix = np.zeros((self.n_classes, self.n_classes))
@@ -97,7 +96,6 @@ class WassersteinDistanceCalculator(DistributionalDistanceCalculator):
 
 
 class OverlapDistanceCalculator(DistributionalDistanceCalculator):
-    """Calculates distance based on the non-overlapping area of KDEs."""
     def calculate(self, train_df: pd.DataFrame) -> np.ndarray:
         logger.info("Starting distance matrix calculation with Overlap (KDE)...")
         dist_matrix = np.zeros((self.n_classes, self.n_classes))
@@ -145,7 +143,6 @@ class OverlapDistanceCalculator(DistributionalDistanceCalculator):
 #
 #############################################################################################################
 class CrossPredictionErrorDistance(DistributionalDistanceCalculator):
-    """Calculates distance based on cross-prediction error (CPED) using polynomial models."""
     def __init__(self, numerical_features, categorical_feature, target_variable, n_classes, degree=2):
         super().__init__(numerical_features, categorical_feature, target_variable, n_classes)
         self.degree = degree
@@ -198,13 +195,8 @@ class CrossPredictionErrorDistance(DistributionalDistanceCalculator):
             for j in class_data.keys():
                 model_i = models[i]
                 X_j, y_j = class_data[j]
-                y_pred = model_i.predict(X_j)
-                
-                #r2 = r2_score(y_j, y_pred)
-                #error = 1 - r2
-                
+                y_pred = model_i.predict(X_j)                
                 error = mean_absolute_error(y_j, y_pred)
-                
                 error_matrix[i, j] = error
         return error_matrix
     
@@ -292,10 +284,6 @@ class CrossPredictionErrorDistanceKNN(DistributionalDistanceCalculator):
 #############################################################################################################
 
 class ResidualDistributionDistance(DistributionalDistanceCalculator):
-    """
-    Calculates distance based on the Wasserstein distance between
-    the distributions of model residuals (Residual Distribution Distance - RDD).
-    """
     def __init__(self, numerical_features, categorical_feature, target_variable, n_classes, model_params=None):
         super().__init__(numerical_features, categorical_feature, target_variable, n_classes)
         if model_params is None:
@@ -634,28 +622,19 @@ class CrossIntegralDifference2D(DistributionalDistanceCalculator):
     def _spatial_representative_sample(self, df, n_samples, features=['Length', 'Width']):
         from sklearn.cluster import KMeans
         from sklearn.metrics import pairwise_distances_argmin_min
-        """
-        Seleziona n_samples che coprono in modo omogeneo lo spazio delle feature
-        utilizzando i centroidi del K-Means.
-        """
         if len(df) <= n_samples:
             return df
 
-        # 1. Normalizziamo temporaneamente per il clustering (importante per distanze euclidee)
         X = df[features].values
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
 
-        # 2. Troviamo N cluster nello spazio delle feature
         kmeans = KMeans(n_clusters=n_samples, random_state=42, n_init=10)
         kmeans.fit(X_scaled)
         centroids = kmeans.cluster_centers_
 
-        # 3. Per ogni centroide, troviamo il punto reale più vicino
-        # (così usiamo dati reali e non medie sintetiche)
         closest, _ = pairwise_distances_argmin_min(centroids, X_scaled)
         
-        # Rimuoviamo duplicati se presenti
         indices = np.unique(closest)
         
         return df.iloc[indices]
@@ -664,7 +643,6 @@ class CrossIntegralDifference2D(DistributionalDistanceCalculator):
     def _train_function_per_class(self, train_df: pd.DataFrame):
         funcs, class_data = {}, {}
         
-        # Definiamo un limite ragionevole per il GPR (es. 800 punti)
         MAX_GPR_SAMPLES = 800 
 
         for class_id in range(self.n_classes):
@@ -674,11 +652,9 @@ class CrossIntegralDifference2D(DistributionalDistanceCalculator):
             if len(df_class) < self.min_samples:
                 continue
 
-            # --- LOGICA DI CAMPIONAMENTO SPAZIALE ---
             if len(df_class) > MAX_GPR_SAMPLES:
                 logger.info(f"Applying spatial sampling for class '{class_name}' ({len(df_class)} -> {MAX_GPR_SAMPLES})")
                 df_class = self._spatial_representative_sample(df_class, MAX_GPR_SAMPLES)
-            # ----------------------------------------
 
             X_np = df_class[['Length', 'Width']].values 
             y_np = df_class[self.target_variable].values
@@ -812,19 +788,8 @@ class CrossIntegralDifference2D(DistributionalDistanceCalculator):
         return dist_matrix
     
 #############################################################################################################
-#
-#   SOTTO HO PROVATO UNA NUOVA METRICA COSTRUITA SULLA MEDIA DI 3 DISTANZE:
-##       - Distanza Funzionale (RDD)
-##       - Distanza Rappresentazionale (basata su AUC di un classificatore)
-##       - Distanza Distribuzionale (Wasserstein o Overlap)
-#
-#############################################################################################################
+
 class RepresentationalDistanceCalculator(DistributionalDistanceCalculator):
-    """
-    Calculates distance based on the distinguishability of input features (X) between classes.
-    Uses a binary classifier's AUC to measure separability.
-    d = 2 * (AUC - 0.5)
-    """
     def calculate(self, train_df: pd.DataFrame) -> np.ndarray:
         logger.info("Starting Representational distance matrix calculation (Classifier-based)...")
         dist_matrix = np.zeros((self.n_classes, self.n_classes))
@@ -957,7 +922,6 @@ class FunctionalDistanceEnsembleCalculator(ResidualDistributionDistance):
         return dist_matrix
 
     def _calculate_rdd_from_residuals(self, residual_distributions):
-        """Helper to calculate the RDD matrix from a set of residuals."""
         dist_matrix = np.full((self.n_classes, self.n_classes), np.nan)
         for i in range(self.n_classes):
             for j in range(i + 1, self.n_classes):
@@ -976,14 +940,6 @@ class FunctionalDistanceEnsembleCalculator(ResidualDistributionDistance):
         return dist_matrix
     
 class TrinitarianDistanceCalculator(DistributionalDistanceCalculator):
-    """
-    Calculates a universal distance by combining three perspectives:
-    1. d_dist (Distributional): Wasserstein distance on the target variable.
-    2. d_repr (Representational): Classifier-based distance on the input features.
-    3. d_func (Functional): Ensemble RDD-based distance on the X->y relationship.
-    
-    Combines them with specified weights.
-    """
     def __init__(self, numerical_features, categorical_feature, target_variable, n_classes,
                  weights={'dist': 0.33, 'repr': 0.33, 'func': 0.34}):
         super().__init__(numerical_features, categorical_feature, target_variable, n_classes)
@@ -1017,7 +973,7 @@ class TrinitarianDistanceCalculator(DistributionalDistanceCalculator):
 
 #############################################################################################################
 #
-#   FACTORY FUNCTION TO GET THE DESIRED CALCULATOR
+#   FACTORY FUNCTION
 #
 #############################################################################################################
 

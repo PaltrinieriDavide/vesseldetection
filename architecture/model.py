@@ -9,7 +9,7 @@ from torchvision.ops import MultiScaleRoIAlign
 from typing import Dict, List, Optional
 import math
 
-# --- 1. MODULO MORFOLOGICO PYTORCH ---
+
 class MorphologicalPreprocessing(nn.Module):
     def __init__(self, kernel_size=3):
         super().__init__()
@@ -31,10 +31,10 @@ class MorphologicalPreprocessing(nn.Module):
         black_hat = closing - x
         morph_grad = dil - ero
         
-        # Ritorna ESATTAMENTE 6 canali (Originale + 5 operazioni)
+        
         return torch.cat([x, ero, opening, top_hat, black_hat, morph_grad], dim=1)
 
-# --- 2. COORDINATE CHANNEL ATTENTION (CCA) CON RESIDUAL ---
+
 class CCA(nn.Module):
     def __init__(self, in_channels, reduction=16):
         super().__init__()
@@ -65,7 +65,7 @@ class CCA(nn.Module):
         
         return x + (x * a_h * a_w)
 
-# --- 3. BOTTOM-UP PATH (Bidirezionale) ---
+
 class BottomUpPath(nn.Module):
     def __init__(self, channels=256):
         super().__init__()
@@ -89,7 +89,7 @@ class BottomUpPath(nn.Module):
             out[curr_k] = features[curr_k] + downsampled
         return out
 
-# --- 4. BACKBONE POTENZIATO TOTALE ---
+
 class EnhancedBackbone(nn.Module):
     def __init__(self, base_backbone):
         super().__init__()
@@ -103,9 +103,9 @@ class EnhancedBackbone(nn.Module):
         self.bottom_up = BottomUpPath(self.out_channels)
 
     def forward(self, x):
-        # 1 Canale -> 6 Canali
+        
         x = self.morph(x)
-        # Il base_backbone ora si aspetta 6 canali
+        
         features = self.base_backbone(x)
         
         cca_features = OrderedDict()
@@ -119,26 +119,26 @@ class HybridVesselModel(nn.Module):
     def __init__(self, num_classes: int = 4, pretrained_backbone: bool = True):
         super().__init__()
         
-        # 1. Utilizziamo ResNeXt50
+        
         base_backbone = resnet_fpn_backbone(
             backbone_name='resnext50_32x4d', 
             weights='DEFAULT' if pretrained_backbone else None, 
             trainable_layers=3
         )
 
-        # 2. ADATTIAMO LOGICAMENTE IL CONV1 A 6 CANALI (La tua intuizione originale!)
+        
         conv1 = base_backbone.body.conv1
         new_conv1 = nn.Conv2d(6, conv1.out_channels, kernel_size=conv1.kernel_size, 
                               stride=conv1.stride, padding=conv1.padding, bias=False)
         if pretrained_backbone:
-            # Spalmiamo i pesi sui 6 canali in modo equilibrato
+            
             new_conv1.weight.data = conv1.weight.data.mean(dim=1, keepdim=True).repeat(1, 6, 1, 1) / 6.0
         base_backbone.body.conv1 = new_conv1
 
-        # 3. Assembliamo il backbone
+        
         self.backbone = EnhancedBackbone(base_backbone)
 
-        # 4. Ancore SAR Estreme
+        
         anchor_sizes = ((8, 16, 32, 64, 128, 256),) * 5
         aspect_ratios = ((0.2, 0.5, 1.0, 2.0, 5.0),) * 5
         
@@ -149,21 +149,21 @@ class HybridVesselModel(nn.Module):
             box_regression_loss_type="ciou", 
             image_mean=[0.0], 
             image_std=[1.0],
-            box_score_thresh=0.20,      # MODIFICATO DA 0.15 a 0.20
-            box_nms_thresh=0.5          # MODIFICATO DA 0.4 a 0.5
+            box_score_thresh=0.20,      
+            box_nms_thresh=0.5          
         )
 
         self.roi_pool = MultiScaleRoIAlign(featmap_names=['0', '1', '2', '3'], output_size=7, sampling_ratio=2)
         
-        # --- MODIFICA DECOUPLED HEADS ---
-        # 1. Testa di Classificazione (FUSAR) - Alto Dropout (0.5) per distruggere l'overfitting
+        
+        
         self.cls_features = nn.Sequential(
             nn.Linear(256 * 7 * 7, 1024), nn.LayerNorm(1024), nn.ReLU(), nn.Dropout(0.5),
             nn.Linear(1024, 512), nn.LayerNorm(512), nn.ReLU(), nn.Dropout(0.5)
         )
         self.cls_head = nn.Linear(512, num_classes)
 
-        # 2. Testa di Regressione (HRSID) - Basso Dropout (0.1) per preservare la memoria spaziale
+        
         self.reg_features = nn.Sequential(
             nn.Linear(256 * 7 * 7, 1024), nn.LayerNorm(1024), nn.ReLU(), nn.Dropout(0.1),
             nn.Linear(1024, 512), nn.LayerNorm(512), nn.ReLU(), nn.Dropout(0.1)
@@ -180,7 +180,7 @@ class HybridVesselModel(nn.Module):
         """Aggiunge un padding percentuale alla bbox con controlli di sicurezza"""
         x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
         
-        w = max(x2 - x1, 1.0) # FIX: evita w o h negativi/nulli
+        w = max(x2 - x1, 1.0) 
         h = max(y2 - y1, 1.0)
         
         px = w * padding_factor
@@ -198,7 +198,7 @@ class HybridVesselModel(nn.Module):
         boxes = det_out_dict['boxes']
         scores = det_out_dict['scores']
         
-        # Funzione interna di Fallback (60% centrale dell'immagine)
+        
         def get_fallback_box():
             cx, cy = img_w / 2.0, img_h / 2.0
             w, h = img_w * 0.6, img_h * 0.6
@@ -208,7 +208,7 @@ class HybridVesselModel(nn.Module):
             y2 = min(cy + h / 2.0, float(img_h))
             return torch.tensor([[x1, y1, x2, y2]], device=device)
 
-        # Se non ci sono detection dalla RPN
+        
         if len(boxes) == 0:
             return get_fallback_box()
             
@@ -234,7 +234,7 @@ class HybridVesselModel(nn.Module):
                 best_metric = metric
                 best_box = b
                 
-        # FALLBACK: se nessuna box ha superato i filtri
+        
         if best_box is None: 
             return get_fallback_box()
             
@@ -251,8 +251,8 @@ class HybridVesselModel(nn.Module):
 
         if phase in ['det_reg', 'multi']:
             if self.training and targets is not None:
-                # FIX KeyError: Filtra le immagini che hanno effettivamente delle bounding box (HRSID)
-                # e ignora quelle di classificazione (FUSAR) per il calcolo della loss di detection
+                
+                
                 valid_det_imgs = []
                 valid_det_targs =[]
                 for img, t in zip(images, targets):
@@ -260,14 +260,14 @@ class HybridVesselModel(nn.Module):
                         valid_det_imgs.append(img)
                         valid_det_targs.append(t)
                 
-                # Calcola la loss solo se c'è almeno un'immagine HRSID nel batch
+                
                 if len(valid_det_imgs) > 0:
                     det_losses = self.detector(valid_det_imgs, valid_det_targs)
                     losses.update(det_losses)
             else:
                 detections = self.detector(images)
 
-        # Bootstrapping dei BBox
+        
         boxes =[]
         if phase == 'cls' or (not self.training and phase == 'cls'):
             was_training = self.detector.training
@@ -282,10 +282,10 @@ class HybridVesselModel(nn.Module):
                 
         elif phase in['det_reg', 'multi']:
             for i, t in enumerate(targets if targets else images):
-                if targets and 'dimensions' in t: # HRSID
+                if targets and 'dimensions' in t: 
                     boxes.append(t['boxes'])
-                elif targets and 'category_id' in t: # FUSAR
-                    # Se stiamo validando/testando, usiamo le detections di batch già pre-calcolate!
+                elif targets and 'category_id' in t: 
+                    
                     if not self.training and phase in ['det_reg', 'multi']:
                         out = detections[i]
                     else:
@@ -296,25 +296,25 @@ class HybridVesselModel(nn.Module):
                         
                     _, h, w = images[i].shape
                     boxes.append(self._get_best_centered_box(out, h, w, images_stack.device))
-                else: # Inferenza pura (Validation/Test senza target specifici)
+                else: 
                     if phase in ['det_reg', 'multi']: 
                         boxes.append(detections[i]['boxes'])
                     else: 
                         boxes.append(torch.empty((0, 4), device=images_stack.device))
 
-        # Estrattore ROI: Passiamo TUTTE le box (anche vuote) per mantenere l'allineamento batch
+        
         padded_sizes =[img.shape[-2:] for img in padded_images]
         total_boxes = sum(b.shape[0] for b in boxes)
         
         if total_boxes > 0:
             roi_feats = self.roi_pool(features, boxes, padded_sizes).flatten(start_dim=1)
             
-            # --- MODIFICA 1: DECOUPLED HEADS ---
-            # Percorso Classificazione (FUSAR)
+            
+            
             cls_feats = self.cls_features(roi_feats)
             logits = self.cls_head(cls_feats)
             
-            # Percorso Regressione (HRSID)
+            
             reg_feats = self.reg_features(roi_feats)
             
             box_dims =[]
@@ -326,10 +326,10 @@ class HybridVesselModel(nn.Module):
                     box_dims.append(torch.stack([bw, bh], dim=1))
             
             box_dims = torch.cat(box_dims, dim=0)
-            # Concateniamo reg_feats invece del vecchio attr_feats
+            
             lw_pred = self.reg_head(torch.cat([reg_feats, box_dims], dim=1))
         else:
-            # Fallback se tutto il batch è vuoto
+            
             logits = torch.empty((0, self.cls_head.out_features), device=images_stack.device)
             lw_pred = torch.empty((0, 2), device=images_stack.device)
 
@@ -355,15 +355,15 @@ class HybridVesselModel(nn.Module):
                 current_box_idx += num_boxes
                 
             if len(valid_cls_idx) > 0:
-                # --- MODIFICA 2: FOCAL LOSS ---
+                
                 target_cls = torch.cat(cls_targets)
                 pred_logits = logits[valid_cls_idx]
                 
-                # Calcolo Cross Entropy non ridotta
+                
                 ce_loss = F.cross_entropy(pred_logits, target_cls, reduction='none')
-                # Calcolo p_t
+                
                 pt = torch.exp(-ce_loss)
-                # Applica gamma (2.0)
+                
                 gamma = 2.0
                 focal_loss = (((1 - pt) ** gamma) * ce_loss).mean()
                 
@@ -374,13 +374,13 @@ class HybridVesselModel(nn.Module):
 
         return out, losses
     
-    # ==========================================================
-    # === METODI DI ROUTING DEI GRADIENTI (FROZEN/UNFROZEN) ===
-    # ==========================================================
+    
+    
+    
 
-    # === 1. GESTIONE DETECTOR (RPN e RoI Base di Faster R-CNN) ===
+    
     def freeze_detection(self):
-        # Blocchiamo in modo chirurgico SOLO l'RPN e la testa di detection, NON il backbone!
+        
         for p in self.detector.rpn.parameters(): p.requires_grad = False
         for p in self.detector.roi_heads.parameters(): p.requires_grad = False
 
@@ -388,7 +388,7 @@ class HybridVesselModel(nn.Module):
         for p in self.detector.rpn.parameters(): p.requires_grad = True
         for p in self.detector.roi_heads.parameters(): p.requires_grad = True
 
-    # === 2. GESTIONE TESTA DI CLASSIFICAZIONE (FUSAR) ===
+    
     def freeze_cls_head(self):
         for p in self.cls_features.parameters(): p.requires_grad = False
         for p in self.cls_head.parameters(): p.requires_grad = False
@@ -397,7 +397,7 @@ class HybridVesselModel(nn.Module):
         for p in self.cls_features.parameters(): p.requires_grad = True
         for p in self.cls_head.parameters(): p.requires_grad = True
 
-    # === 3. GESTIONE TESTA DI REGRESSIONE/DIMENSIONI (HRSID) ===
+    
     def freeze_reg_head(self):
         for p in self.reg_features.parameters(): p.requires_grad = False
         for p in self.reg_head.parameters(): p.requires_grad = False
@@ -406,23 +406,23 @@ class HybridVesselModel(nn.Module):
         for p in self.reg_features.parameters(): p.requires_grad = True
         for p in self.reg_head.parameters(): p.requires_grad = True
         
-    # === 4. GESTIONE BACKBONE ===
+    
     def unfreeze_backbone_last_layers(self):
-        # Congela tutto il backbone di base
+        
         for p in self.backbone.parameters(): 
             p.requires_grad = False
             
-        # Sblocca solo il blocco semantico più alto (layer4) e la FPN per adattarsi al SAR
+        
         if hasattr(self.backbone.base_backbone, 'body') and hasattr(self.backbone.base_backbone.body, 'layer4'):
             for p in self.backbone.base_backbone.body.layer4.parameters(): p.requires_grad = True
                 
         if hasattr(self.backbone.base_backbone, 'fpn'):
             for p in self.backbone.base_backbone.fpn.parameters(): p.requires_grad = True
                 
-        # Sblocca i moduli di Attenzione Spaziale (CCA)
+        
         if hasattr(self.backbone, 'cca_modules'):
             for p in self.backbone.cca_modules.parameters(): p.requires_grad = True
             
-        # Sblocca la Feature Pyramid Bidirezionale (BottomUpPath)
+        
         if hasattr(self.backbone, 'bottom_up'):
             for p in self.backbone.bottom_up.parameters(): p.requires_grad = True

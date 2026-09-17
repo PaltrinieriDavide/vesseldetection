@@ -1,13 +1,8 @@
-# file: visualization.py
-
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 def plot_target_distributions_by_class(df, categorical_feature, target_variable, class_mapping, output_path=None):
-    """
-    Generates and optionally saves a plot of the target distributions by class.
-    """
     plt.figure(figsize=(12, 8))
     
     inverse_class_mapping = {v: k for k, v in class_mapping.items()}

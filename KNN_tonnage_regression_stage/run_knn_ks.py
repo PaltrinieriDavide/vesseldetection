@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-run_knn_ks.py
-
-Ks = class-specific KNN regressor, as defined in the paper:
-- one independent KNN regressor is trained for each vessel class lambda;
-- at inference time, the sample is predicted only with the KNN of its own class;
-- this is equivalent to delta_cat(lambda_i, lambda_j) = infinity for different classes.
-
-This is NOT alpha=0. Alpha=0 is class-agnostic Ka.
-"""
-
 import argparse
 import os
 import warnings
@@ -27,11 +14,6 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
-
-# -----------------------------------------------------------------------------
-# Metrics
-# -----------------------------------------------------------------------------
-
 def ape_percent(y_true, y_pred, eps: float = 1e-8) -> np.ndarray:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -46,7 +28,6 @@ def mape_percent(y_true, y_pred) -> float:
 def median_ape_percent(y_true, y_pred) -> float:
     return float(np.median(ape_percent(y_true, y_pred)))
 
-
 def safe_r2(y_true, y_pred) -> float:
     try:
         if len(np.unique(y_true)) < 2:
@@ -54,11 +35,6 @@ def safe_r2(y_true, y_pred) -> float:
         return float(r2_score(y_true, y_pred))
     except Exception:
         return float("nan")
-
-
-# -----------------------------------------------------------------------------
-# Column detection
-# -----------------------------------------------------------------------------
 
 def _norm_col(c: str) -> str:
     return str(c).strip().lower().replace(" ", "_").replace("-", "_")
@@ -81,22 +57,7 @@ def find_column(df: pd.DataFrame, candidates: List[str], arg_value: Optional[str
     )
 
 
-# -----------------------------------------------------------------------------
-# Class-specific model
-# -----------------------------------------------------------------------------
-
 class ClassSpecificKNNRegressor(BaseEstimator, RegressorMixin):
-    """
-    One separate KNN model for each class.
-
-    X must be a pandas DataFrame with columns:
-      - length_col
-      - width_col
-      - class_col
-
-    During prediction, each row is routed to the KNN trained on its own class.
-    If an unseen class appears at test time, the global fallback KNN is used.
-    """
 
     def __init__(
         self,
@@ -264,10 +225,6 @@ class ClassSpecificKNNRegressor(BaseEstimator, RegressorMixin):
         return np.maximum(preds, 0.0)
 
 
-# -----------------------------------------------------------------------------
-# Reporting
-# -----------------------------------------------------------------------------
-
 def performance_by_class(
     df_test: pd.DataFrame,
     y_true: np.ndarray,
@@ -305,11 +262,6 @@ def print_results(metric_name: str, y_true, y_pred, per_class_df: pd.DataFrame):
     print(f"Median_APE:        {median_ape_percent(y_true, y_pred):.6f}%")
     print(f"MAE:               {mean_absolute_error(y_true, y_pred):.6f}")
     print(f"R2:                {safe_r2(y_true, y_pred):.6f}")
-
-
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
 
 def parse_int_tuple(s: str) -> Tuple[int, ...]:
     return tuple(int(x.strip()) for x in s.split(",") if x.strip())

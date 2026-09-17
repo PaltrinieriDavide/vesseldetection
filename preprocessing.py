@@ -20,19 +20,16 @@ class SARPreprocess:
     def __call__(self, img_pil):
         img_pil = img_pil.convert("L")
         
-        # 1. Applicazione CLAHE (Miglioramento contrasto locale)
         if self.use_clahe:
             img_np = np.array(img_pil, dtype=np.uint8)
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
             img_clahe = clahe.apply(img_np)
             img_pil = Image.fromarray(img_clahe)
 
-        # 2. Conversione in Tensore
         x = TF.to_tensor(img_pil)
         if x.max() <= 1.0: 
             x = x * 255.0
             
-        # 3. Log transform e Normalizzazione SAR standard
         x = torch.log(x + 1e-6)
         x = torch.clamp(x, self.clip_lo, self.clip_hi)
         x = (x - self.mean) / (self.std + 1e-6)
@@ -47,7 +44,6 @@ class FUSARDataset(torch.utils.data.Dataset):
         self.image_dir = Path(image_dir)
         self.augment = augment
         
-        # Preprocessing con CLAHE
         self.preprocess = SARPreprocess(mean=2.6584, std=0.7534, use_clahe=True)
         
         self.images = {img['id']: img for img in self.coco_data['images']}
@@ -56,14 +52,11 @@ class FUSARDataset(torch.utils.data.Dataset):
         self.class_to_idx = {c: i for i, c in enumerate(categories)}
         self.valid_ids = list(self.annotations.keys())
 
-        # --- Calcolo della rarità per le Augmentation Mirate ---
         class_counts = defaultdict(int)
         for ann in self.annotations.values():
             class_counts[ann['category_name']] += 1
         max_count = max(class_counts.values()) if class_counts else 1
         
-        # Le classi rare avranno una probabilità di rotazione vicina al 90%, 
-        # le classi dominanti manterranno un minimo del 20%
         self.aug_probs = {}
         for cat in categories:
             freq = class_counts[cat] / max_count
@@ -84,17 +77,12 @@ class FUSARDataset(torch.utils.data.Dataset):
         img_tensor = self.preprocess(img_pil)
         
         if self.augment:
-            # 1. Flip Base (Spaziale)
             if random.random() > 0.5: 
                 img_tensor = TF.hflip(img_tensor)
             if random.random() > 0.5: 
                 img_tensor = TF.vflip(img_tensor)
 
-            # 2. Rotazione Mirata per Bilanciamento
-            # Usa la probabilità precedentemente calcolata in base alla classe
             if random.random() < self.aug_probs[cls]:
-                # Scegliamo casualmente di ruotare di 90, 180 o 270 gradi
-                # Usiamo torch.rot90 che è matematicamente perfetto sui tensori e non crea bordi neri
                 k_rot = random.choice([1, 2, 3]) 
                 img_tensor = torch.rot90(img_tensor, k=k_rot, dims=[1, 2])
 
@@ -112,7 +100,6 @@ class HRSIDDataset(torch.utils.data.Dataset):
         self.image_dir = Path(image_dir)
         self.augment = augment
         
-        # Preprocessing con CLAHE
         self.preprocess = SARPreprocess(mean=3.5796, std=0.7026, use_clahe=True)
         
         self.images = {img['id']: img for img in self.coco_data['images']}
@@ -143,7 +130,6 @@ class HRSIDDataset(torch.utils.data.Dataset):
         for ann in anns:
             x, y, w, h = ann['bbox']
             boxes.append([x, y, x + w, y + h])
-            # Preleviamo le dimensioni in metri dal json di HRSID
             l_val = ann.get('length', 0.0) / self.max_L
             w_val = ann.get('width', 0.0) / self.max_W
             dimensions.append([l_val, w_val])
@@ -151,7 +137,6 @@ class HRSIDDataset(torch.utils.data.Dataset):
         boxes = torch.tensor(boxes, dtype=torch.float32)
         dimensions = torch.tensor(dimensions, dtype=torch.float32)
         
-        # Data Augmentation Spaziale Rigida con ri-calcolo BBox
         if self.augment and boxes.numel() > 0:
             if random.random() > 0.5:
                 img_tensor = TF.hflip(img_tensor)

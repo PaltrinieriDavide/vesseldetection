@@ -12,7 +12,7 @@ from collections import defaultdict
 from architecture.model import HybridVesselModel
 from data import create_dataloaders
 
-# === COCO-style AP Calculation (come sopra; omesso qui per brevità — copia da risposta precedente) ===
+
 def compute_ap(recall, precision):
     mrec = np.concatenate(([0.], recall, [1.]))
     mpre = np.concatenate(([0.], precision, [0.]))
@@ -268,11 +268,11 @@ def test_epoch(model, dataloader, device, task, gt_map):
                     preds, _ = model(single_img, phase=task)
                 metrics.update(preds, single_tgt, task)
                 img_id = single_tgt[0]['image_id'].item() if isinstance(single_tgt[0]['image_id'], torch.Tensor) else single_tgt[0]['image_id']
-                # GT bboxes
+                
                 if 'boxes' in single_tgt[0]:
                     for b in single_tgt[0]['boxes'].cpu().numpy():
                         gt_dict[img_id].append(b.tolist())
-                # Detections (per mAP)
+                
                 if 'detections' in preds:
                     det = preds['detections'][0]
                     keep = (det['scores'] > 0.05)
@@ -285,25 +285,25 @@ def test_epoch(model, dataloader, device, task, gt_map):
     return metrics.get_metrics(), {'AP50': ap50, 'APs': AP_S, 'APm': AP_M, 'APl': AP_L}
 
 def log_det_metrics(logger, metrics, ap_metrics):
-    logger.info(f"  Precision:      {metrics['precision']:.4f}")
-    logger.info(f"  Recall:         {metrics['recall']:.4f}")
-    logger.info(f"  F1 Score:       {metrics['f1']:.4f}")
-    logger.info(f"  IoU (BBOX):     {metrics['iou']:.4f}")
-    logger.info(f"  MAPE Length (m):{metrics['mape_length']:.2f}%")
-    logger.info(f"  MAPE Width (m): {metrics['mape_width']:.2f}%")
+    logger.info(f"  Precision: {metrics['precision']:.4f}")
+    logger.info(f"  Recall: {metrics['recall']:.4f}")
+    logger.info(f"  F1 score: {metrics['f1']:.4f}")
+    logger.info(f"  Bounding box IoU: {metrics['iou']:.4f}")
+    logger.info(f"  Length MAPE: {metrics['mape_length']:.2f}%")
+    logger.info(f"  Width MAPE: {metrics['mape_width']:.2f}%")
     if 'mae_length_pixel' in metrics:
-        logger.info(f"  MAPE Length px: {metrics['mape_length']:.2f}%")
-        logger.info(f"  MAPE Width px:  {metrics['mape_width']:.2f}%")
-        logger.info(f"  MAE Length px:  {metrics['mae_length_pixel']:.2f} px")
-        logger.info(f"  MAE Width px:   {metrics['mae_width_pixel']:.2f} px")
-    logger.info(f"  Det Rate:       {metrics['detection_rate']:.2f} boxes/img")
-    logger.info(f"  AP50 (mAP@0.5IoU): {ap_metrics['AP50']:.4f}")
-    logger.info(f"  APs  (small):      {ap_metrics['APs']:.4f}")
-    logger.info(f"  APm  (medium):     {ap_metrics['APm']:.4f}")
-    logger.info(f"  APl  (large):      {ap_metrics['APl']:.4f}")
+        logger.info(f"  Length MAPE (repeated): {metrics['mape_length']:.2f}%")
+        logger.info(f"  Width MAPE (repeated): {metrics['mape_width']:.2f}%")
+        logger.info(f"  Length MAE: {metrics['mae_length_pixel']:.2f} px")
+        logger.info(f"  Width MAE: {metrics['mae_width_pixel']:.2f} px")
+    logger.info(f"  Detection rate: {metrics['detection_rate']:.2f} boxes/img")
+    logger.info(f"  AP at IoU 0.50: {ap_metrics['AP50']:.4f}")
+    logger.info(f"  AP for small objects: {ap_metrics['APs']:.4f}")
+    logger.info(f"  AP for medium objects: {ap_metrics['APm']:.4f}")
+    logger.info(f"  AP for large objects: {ap_metrics['APl']:.4f}")
 
 def log_cls_metrics(logger, metrics):
-    logger.info(f"  Accuracy (cls): {metrics['accuracy']:.4f}")
+    logger.info(f"  Classification accuracy: {metrics['accuracy']:.4f}")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -316,19 +316,19 @@ def main():
     gt_map = build_ground_truth_map(config)
     model = HybridVesselModel(num_classes=config['model']['num_classes'], pretrained_backbone=False).to(device)
     dataloaders = create_dataloaders(config)
-    # Carica un solo checkpoint: il modello finale
+    
     ckpt_path = Path("/root/dark-vessel-paltrinieri/HRSID_pipeline/ZZZ_MODELS/final_hybrid_model.pt")
     if not ckpt_path.exists():
-        logger.error(f"  [!] Checkpoint not found: {ckpt_path.name}. Exit.")
+        logger.error(f"Checkpoint not found: {ckpt_path.name}. Evaluation cannot continue.")
         return
-    logger.info(f"  --> Loading final model weights: {ckpt_path}")
+    logger.info(f"Loading final model weights from: {ckpt_path}")
     model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
-    logger.info(f"\n{'='*60}\n  Testing FINAL HYBRID MODEL...\n{'='*60}")
-    # Valuta come detection e classification separatamente
-    logger.info("\n  --- Evaluating on HRSID Test Set (Detection Task) ---")
+    logger.info(f"\n{'='*60}\n  Evaluating the final hybrid model\n{'='*60}")
+    
+    logger.info("\n  Evaluating the HRSID test set (detection)")
     metrics_hrsid, ap_metrics_hrsid = test_epoch(model, dataloaders['test_hrsid'], device, 'det_reg', gt_map)
     log_det_metrics(logger, metrics_hrsid, ap_metrics_hrsid)
-    logger.info("\n  --- Evaluating on FUSAR Test Set (Classification Task) ---")
+    logger.info("\n  Evaluating the FUSAR test set (classification)")
     metrics_fusar, _ = test_epoch(model, dataloaders['test_fusar'], device, 'cls', gt_map)
     log_cls_metrics(logger, metrics_fusar)
 
